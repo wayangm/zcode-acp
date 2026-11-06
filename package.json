@@ -1,0 +1,33 @@
+{
+  "name": "zcode-acp",
+  "version": "1.0.0",
+  "description": "Agent Client Protocol (ACP) stdio adapter for the ZCode CLI, for ACP clients such as OpenBot",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "zcode-acp": "zcode-acp.mjs"
+  },
+  "files": [
+    "zcode-acp.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "zcode",
+    "openbot",
+    "coding-agent"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wayangm/zcode-acp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wayangm/zcode-acp/issues"
+  },
+  "homepage": "https://github.com/wayangm/zcode-acp#readme"
+}
