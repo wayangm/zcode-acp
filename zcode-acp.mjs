@@ -13,12 +13,12 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
-import { existsSync, appendFileSync, readdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { existsSync, appendFileSync, readdirSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -329,17 +329,34 @@ function extractResultJson(stdout) {
   return objects.findLast((j) => 'response' in j) ?? objects.at(-1) ?? null;
 }
 
+// Windows refuses a command line past 32,767 characters, and OpenBot wraps every prompt in
+// sizeable instructions. Past this limit the task travels as an attached file instead of argv.
+const MAX_ARGV_TASK_CHARS = 6_000;
+// Heartbeat thoughts: milestones instead of a fixed tick, so a long turn reads as a few lines.
+const HEARTBEAT_DELAYS_MS = [30_000, 60_000, 120_000, 240_000, 420_000];
+const HEARTBEAT_LATER_EVERY_MS = 300_000;
+
 function startTurn(sessionId, params, id) {
   const sess = sessions.get(sessionId);
   if (!sess) return replyError(id, -32602, `unknown session: ${sessionId}`);
   if (sess.child) return replyError(id, -32603, 'a turn is already running for this session');
 
   const { text, attach } = promptToText(params?.prompt);
-  const args = [ZCODE_CJS, '-p', text, '--json', '--cwd', sess.cwd];
+  let taskFile = null;
+  let promptText = text;
+  if (text.length > MAX_ARGV_TASK_CHARS) {
+    taskFile = path.join(os.tmpdir(), `zcode-acp-task-${randomUUID()}.txt`);
+    writeFileSync(taskFile, text, 'utf8');
+    promptText = 'The attached file is the complete task. Carry it out exactly, including the final instruction it ends with.';
+    log('long task via attach:', taskFile, `(${text.length} chars)`);
+  }
+  const args = [ZCODE_CJS, '-p', promptText, '--json', '--cwd', sess.cwd];
   for (const f of attach) args.push('--attach', f);
+  if (taskFile) args.push('--attach', taskFile);
   if (sess.zcodeSessionId) args.push('--resume', sess.zcodeSessionId);
 
   if (!existsSync(ZCODE_CJS)) {
+    if (taskFile) try { unlinkSync(taskFile); } catch { /* best effort */ }
     sendChunk(sessionId, `ZCode CLI not found at ${ZCODE_CJS}. Install ZCode Desktop or set ZCODE_CLI_PATH.`);
     return reply(id, { stopReason: 'refusal' });
   }
@@ -350,17 +367,48 @@ function startTurn(sessionId, params, id) {
   log('turn start', sessionId, 'resume:', sess.zcodeSessionId ?? '(new)',
     'builtin:', SPAWN_ENV.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE);
   const startedAt = Date.now();
-  const heartbeat = setInterval(() => {
+  const fmtElapsed = () => {
     const s = Math.round((Date.now() - startedAt) / 1000);
-    sendThought(sessionId, `⏳ ZCode sedang bekerja... ${Math.floor(s / 60)}m ${s % 60}s`);
-  }, 20_000);
-  const stopHeartbeat = () => clearInterval(heartbeat);
-  const child = spawn(process.execPath, args, { cwd: sess.cwd, windowsHide: true, env: SPAWN_ENV });
+    return `${Math.floor(s / 60)}m ${s % 60}s`;
+  };
+  const heartbeatTimers = [];
+  const stopHeartbeat = () => {
+    for (const t of heartbeatTimers) { clearTimeout(t); clearInterval(t); }
+  };
+  const fireHeartbeat = (index) => {
+    if (index >= HEARTBEAT_DELAYS_MS.length) {
+      heartbeatTimers.push(setInterval(
+        () => sendThought(sessionId, `⏳ ZCode sedang bekerja... ${fmtElapsed()}`),
+        HEARTBEAT_LATER_EVERY_MS,
+      ));
+      return;
+    }
+    const due = startedAt + HEARTBEAT_DELAYS_MS.slice(0, index + 1).reduce((a, b) => a + b, 0);
+    heartbeatTimers.push(setTimeout(() => {
+      sendThought(sessionId, `⏳ ZCode sedang bekerja... ${fmtElapsed()}`);
+      fireHeartbeat(index + 1);
+    }, Math.max(0, due - Date.now())));
+  };
+  fireHeartbeat(0);
+
+  let child;
+  try {
+    child = spawn(process.execPath, args, { cwd: sess.cwd, windowsHide: true, env: SPAWN_ENV });
+  } catch (e) {
+    // spawn can throw synchronously (for example ENAMETOOLONG); answer instead of hanging.
+    stopHeartbeat();
+    if (taskFile) try { unlinkSync(taskFile); } catch { /* best effort */ }
+    sendChunk(sessionId, `zcode-acp: failed to start ZCode CLI: ${e?.message ?? e}`);
+    if (sess.promptReply) reply(sess.promptReply, { stopReason: 'refusal' });
+    sess.promptReply = null;
+    return;
+  }
   sess.child = child;
   child.stdout.on('data', (d) => { sess.stdout += d; });
   child.stderr.on('data', (d) => { sess.stderr += d; });
   child.on('error', (e) => {
     stopHeartbeat();
+    if (taskFile) try { unlinkSync(taskFile); } catch { /* best effort */ }
     if (sess.child !== child) return;
     sess.child = null;
     sendChunk(sessionId, `zcode-acp: failed to start ZCode CLI: ${e.message}`);
@@ -369,6 +417,7 @@ function startTurn(sessionId, params, id) {
   });
   child.on('close', (code) => {
     stopHeartbeat();
+    if (taskFile) try { unlinkSync(taskFile); } catch { /* best effort */ }
     if (sess.child !== child) return; // cancelled; already answered
     sess.child = null;
     const parsed = extractResultJson(sess.stdout);
