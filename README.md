@@ -42,11 +42,12 @@ install lives in a custom place.
 
 ## Notes
 
-- The adapter reports the model that ZCode headless actually runs: the first provider of
-  `providerOrder` and its first model, from the same provider config the CLI reads
-  (`~/.zcode/v2/provider_config.json`). The ZCode CLI has no headless model switch yet, so the
-  picker shows this one model and `session/set_model` refuses other ids. No reasoning-effort
-  options are offered for the same reason.
+- The adapter lists the models of your ZCode provider config (`~/.zcode/v2/provider_config.json`):
+  every provider of `providerOrder` with its enabled models. Picking a model in OpenBot moves
+  that provider to the front of the CLI's `providerOrder`, and the next turn runs on it, because
+  each turn spawns a fresh ZCode CLI that re-reads the config. The switch is global: it also
+  becomes the default of new ZCode Desktop sessions. A model whose provider has no balance still
+  fails its turns with the provider's own error (for example 402).
 - The adapter logs to `os.tmpdir()/zcode-acp.log`.
 - One turn at a time per session. `session/cancel` kills the running turn.
 - `session/load` is not supported; a new ACP session maps to a new ZCode session.

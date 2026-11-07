@@ -13,12 +13,12 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
-import { existsSync, appendFileSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, appendFileSync, readdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -102,33 +102,68 @@ function resolveProviderEnv() {
 
 const SPAWN_ENV = resolveProviderEnv();
 
-// The model ZCode headless actually runs: the first provider of `providerOrder` and its first
-// model, read from the same provider config the CLI reads. The ZCode CLI has no headless model
-// switch (no flag, no env), so listing more than this one model would promise a choice that
-// cannot be honored. `session/set_model` accepts only this id.
+// The models ZCode can run, read from the same provider config the CLI reads. The ZCode CLI has
+// no headless model switch (no flag, no env), but every turn spawns a fresh CLI that re-reads
+// `providerOrder` - so switching a model means moving its provider to the front of that order.
+// The change is global: it also becomes the default of new ZCode Desktop sessions.
+function zcodeRoot() {
+  return process.env.ZCODE_HOME?.trim() || path.join(os.homedir(), '.zcode');
+}
+
 function readZcodeModels() {
-  const home = os.homedir();
-  const root = process.env.ZCODE_HOME?.trim() || path.join(home, '.zcode');
   const fallback = { currentModelId: 'zcode', availableModels: [{ modelId: 'zcode', name: 'ZCode' }] };
   try {
-    const config = JSON.parse(readFileSync(path.join(root, 'v2', 'provider_config.json'), 'utf8'));
-    const order = config?.config?.providerOrder;
-    const rules = config?.config?.providerConfigRules?.providerRules;
+    const config = JSON.parse(readFileSync(path.join(zcodeRoot(), 'v2', 'provider_config.json'), 'utf8'));
+    const cfgRoot = config?.config;
+    const order = cfgRoot?.providerOrder;
+    const rules = cfgRoot?.providerConfigRules?.providerRules;
     if (!Array.isArray(order) || !Array.isArray(rules)) return fallback;
+    // Models disabled in the model rules are left out; rules that say nothing leave models enabled.
+    const disabled = new Set();
+    for (const rule of cfgRoot?.modelConfigRules?.providerModelRules ?? []) {
+      if (rule?.config?.enabled === false) disabled.add(`${rule.providerId}/${rule.modelId}`);
+    }
+    const availableModels = [];
     for (const providerId of order) {
       const rule = rules.find((r) => r?.providerId === providerId);
       const cfg = rule?.config ?? {};
-      const modelId = cfg.modelOrder?.find((m) => typeof m === 'string' && m) ?? cfg.personalModelIds?.[0];
-      if (!modelId) continue;
-      const id = `${providerId}/${modelId}`;
-      const name = `${modelId} (${rule.providerName ?? providerId})`;
-      return {
-        currentModelId: id,
-        availableModels: [{ modelId: id, name, description: cfg.api?.baseUrl }],
-      };
+      const models = [
+        ...new Set([...(cfg.modelOrder ?? []), ...(cfg.personalModelIds ?? [])]),
+      ].filter((m) => typeof m === 'string' && m && !disabled.has(`${providerId}/${m}`));
+      for (const modelId of models) {
+        availableModels.push({
+          modelId: `${providerId}/${modelId}`,
+          name: `${modelId} (${rule.providerName ?? providerId})`,
+          description: cfg.api?.baseUrl,
+        });
+      }
     }
+    if (availableModels.length === 0) return fallback;
+    return { currentModelId: availableModels[0].modelId, availableModels };
   } catch { /* no readable provider config */ }
   return fallback;
+}
+
+// Reads the file fresh, moves the provider to the front, writes atomically. Returns false when
+// the config could not be rewritten; the caller then answers without a switch.
+function applyProviderOrder(providerId) {
+  try {
+    const file = path.join(zcodeRoot(), 'v2', 'provider_config.json');
+    const config = JSON.parse(readFileSync(file, 'utf8'));
+    const order = config?.config?.providerOrder;
+    if (!Array.isArray(order) || !order.includes(providerId)) return false;
+    const index = order.indexOf(providerId);
+    if (index > 0) {
+      order.splice(index, 1);
+      order.unshift(providerId);
+      const tmp = `${file}.tmp`;
+      writeFileSync(tmp, JSON.stringify(config, null, 2));
+      renameSync(tmp, file);
+    }
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 const ZCODE_MODELS = readZcodeModels();
@@ -185,13 +220,26 @@ function newSession(params) {
 
 function setModel(params, id) {
   const modelId = params?.modelId;
-  if (typeof modelId === 'string' && ZCODE_MODELS.availableModels.some((m) => m.modelId === modelId)) {
-    log('set_model ok:', modelId);
-    reply(id, {});
-  } else {
+  if (typeof modelId !== 'string' || !ZCODE_MODELS.availableModels.some((m) => m.modelId === modelId)) {
     log('set_model refused:', modelId);
     replyError(id, -32602,
-      `ZCode headless runs the model from the provider order in ~/.zcode/v2/provider_config.json (${ZCODE_MODELS.currentModelId}); the ZCode CLI cannot switch models yet.`);
+      `Unknown model for ZCode. Available: ${ZCODE_MODELS.availableModels.map((m) => m.modelId).join(', ')}`);
+    return;
+  }
+  if (modelId === ZCODE_MODELS.currentModelId) {
+    reply(id, {});
+    return;
+  }
+  // Switching moves the model's provider to the front of the CLI's provider order. Each turn
+  // spawns a fresh CLI that re-reads that order, so the next turn runs on the chosen model.
+  if (applyProviderOrder(modelId.split('/')[0])) {
+    ZCODE_MODELS.currentModelId = modelId;
+    log('set_model applied:', modelId);
+    reply(id, {});
+  } else {
+    // Never fail the turn over a config write; the previously first provider keeps running.
+    log('set_model stored without switch (config write failed):', modelId);
+    reply(id, {});
   }
 }
 
