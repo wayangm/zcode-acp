@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -332,9 +332,9 @@ function extractResultJson(stdout) {
 // Windows refuses a command line past 32,767 characters, and OpenBot wraps every prompt in
 // sizeable instructions. Past this limit the task travels as an attached file instead of argv.
 const MAX_ARGV_TASK_CHARS = 6_000;
-// Heartbeat thoughts: milestones instead of a fixed tick, so a long turn reads as a few lines.
-const HEARTBEAT_DELAYS_MS = [30_000, 60_000, 120_000, 240_000, 420_000];
-const HEARTBEAT_LATER_EVERY_MS = 300_000;
+// The ZCode CLI streams nothing in headless mode, so progress thoughts cannot show real work.
+// One informative line up front, then at most two quiet reminders on very long turns.
+const HEARTBEAT_DELAYS_MS = [360_000, 720_000];
 
 function startTurn(sessionId, params, id) {
   const sess = sessions.get(sessionId);
@@ -371,21 +371,18 @@ function startTurn(sessionId, params, id) {
     const s = Math.round((Date.now() - startedAt) / 1000);
     return `${Math.floor(s / 60)}m ${s % 60}s`;
   };
+  const taskSummary = text.replace(/\s+/gu, ' ').trim().slice(0, 120) + (text.length > 120 ? '…' : '');
+  sendThought(sessionId,
+    `🔧 ${ZCODE_MODELS.currentModelId} mengerjakan: "${taskSummary}" — CLI ZCode tidak men-stream progres; jawaban lengkap menyusul saat turn selesai.`);
   const heartbeatTimers = [];
   const stopHeartbeat = () => {
     for (const t of heartbeatTimers) { clearTimeout(t); clearInterval(t); }
   };
   const fireHeartbeat = (index) => {
-    if (index >= HEARTBEAT_DELAYS_MS.length) {
-      heartbeatTimers.push(setInterval(
-        () => sendThought(sessionId, `⏳ ZCode sedang bekerja... ${fmtElapsed()}`),
-        HEARTBEAT_LATER_EVERY_MS,
-      ));
-      return;
-    }
+    if (index >= HEARTBEAT_DELAYS_MS.length) return;
     const due = startedAt + HEARTBEAT_DELAYS_MS.slice(0, index + 1).reduce((a, b) => a + b, 0);
     heartbeatTimers.push(setTimeout(() => {
-      sendThought(sessionId, `⏳ ZCode sedang bekerja... ${fmtElapsed()}`);
+      sendThought(sessionId, `⏳ Masih bekerja (${fmtElapsed()}) — task coding besar memang lama; jawaban datang saat selesai.`);
       fireHeartbeat(index + 1);
     }, Math.max(0, due - Date.now())));
   };
