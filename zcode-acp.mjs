@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.4.4';
+const VERSION = '1.5.1';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -220,6 +220,42 @@ function sendThought(sessionId, text) {
   });
 }
 
+const TOOL_KIND_BY_NAME = {
+  bash: 'execute', shell: 'execute', terminal: 'execute', command: 'execute',
+  read: 'read', view: 'read', cat: 'read',
+  write: 'edit', edit: 'edit', apply: 'edit', patch: 'edit',
+  search: 'search', grep: 'search', glob: 'search', find: 'search',
+  fetch: 'fetch', web: 'fetch', browser: 'fetch',
+};
+
+function toolKind(toolName) {
+  const lower = String(toolName ?? '').toLowerCase();
+  for (const [needle, kind] of Object.entries(TOOL_KIND_BY_NAME)) {
+    if (lower.includes(needle)) return kind;
+  }
+  return 'other';
+}
+
+function sendToolCall(sessionId, toolCallId, title, kind) {
+  notifyUpdate(sessionId, {
+    sessionUpdate: 'tool_call',
+    toolCallId,
+    title,
+    kind: toolKind(title),
+  });
+}
+
+function sendToolCallUpdate(sessionId, toolCallId, status, title, output) {
+  const update = {
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status,
+  };
+  if (title) update.title = title;
+  if (output) update.content = [{ type: 'content', content: { type: 'text', text: String(output).slice(0, 2000) } }];
+  notifyUpdate(sessionId, update);
+}
+
 function initialize(params) {
   const version = typeof params?.protocolVersion === 'number' ? params.protocolVersion : 1;
   return {
@@ -342,7 +378,7 @@ function startTurn(sessionId, params, id) {
     promptText = 'The attached file is the complete task. Carry it out exactly, including the final instruction it ends with.';
     log('long task via attach:', taskFile, `(${text.length} chars)`);
   }
-  const args = [ZCODE_CJS, '-p', promptText, '--json', '--cwd', sess.cwd];
+  const args = [ZCODE_CJS, '-p', promptText, '--output-format', 'stream-json', '--cwd', sess.cwd];
   for (const f of attach) args.push('--attach', f);
   if (taskFile) args.push('--attach', taskFile);
   if (sess.zcodeSessionId) args.push('--resume', sess.zcodeSessionId);
@@ -387,8 +423,35 @@ function startTurn(sessionId, params, id) {
     return;
   }
   sess.child = child;
-  child.stdout.on('data', (d) => { sess.stdout += d; });
+  sess.streamedText = false;
+  sess.result = null;
   child.stderr.on('data', (d) => { sess.stderr += d; });
+  // stream-json: one NDJSON event per line, as it happens. Forward the meaningful ones live.
+  const outLines = createInterface({ input: child.stdout, terminal: false });
+  outLines.on('line', (line) => {
+    const t = line.trim();
+    if (!t || !t.startsWith('{')) { sess.stdout += line + '\n'; return; }
+    let event;
+    try { event = JSON.parse(t); } catch { sess.stdout += line + '\n'; return; }
+    if (event.type === 'result') { sess.result = event; return; }
+    if (event.type === 'model.streaming') {
+      if (event.kind === 'text_delta' && typeof event.delta === 'string' && event.delta) {
+        sess.streamedText = true;
+        sendChunk(sessionId, event.delta);
+      }
+      return;
+    }
+    if (event.type === 'tool.updated') {
+      const callId = event.toolCallId ?? `tool-${event.partId ?? event.seq ?? 'x'}`;
+      const title = [event.toolName, typeof event.input === 'string' ? event.input.slice(0, 80) : '']
+        .filter(Boolean).join(' ').trim() || 'tool';
+      if (event.kind === 'scheduled') sendToolCall(sessionId, callId, title);
+      else if (event.kind === 'started') sendToolCallUpdate(sessionId, callId, 'in_progress', title);
+      else if (event.kind === 'progress') sendToolCallUpdate(sessionId, callId, 'in_progress', title, event.outputPreview ?? event.stderrTail);
+      else if (event.kind === 'result') sendToolCallUpdate(sessionId, callId, 'completed', title, event.outputPreview ?? event.stdoutTail);
+      else if (event.kind === 'error') sendToolCallUpdate(sessionId, callId, 'failed', title, event.outputPreview);
+    }
+  });
   child.on('error', (e) => {
     stopHeartbeat();
     if (taskFile) try { unlinkSync(taskFile); } catch { /* best effort */ }
@@ -400,17 +463,23 @@ function startTurn(sessionId, params, id) {
   });
   child.on('close', (code) => {
     stopHeartbeat();
+    outLines.close();
     if (taskFile) try { unlinkSync(taskFile); } catch { /* best effort */ }
     if (sess.child !== child) return; // cancelled; already answered
     sess.child = null;
-    const parsed = extractResultJson(sess.stdout);
-    if (code === 0 && parsed && typeof parsed.response === 'string' && parsed.response.length > 0) {
-      if (typeof parsed.sessionId === 'string') sess.zcodeSessionId = parsed.sessionId;
-      sendChunk(sessionId, parsed.response);
+    const result = sess.result;
+    if (code === 0 && result && typeof result.response === 'string') {
+      if (typeof result.sessionId === 'string') sess.zcodeSessionId = result.sessionId;
+      // The answer text was already streamed as deltas; only send it when nothing streamed.
+      if (!sess.streamedText && result.response.length > 0) sendChunk(sessionId, result.response);
       if (sess.promptReply) reply(sess.promptReply, { stopReason: 'end_turn' });
     } else {
       const tail = ((sess.stderr || '') + '\n' + (sess.stdout || '')).trim().slice(-1500);
-      const detail = parsed?.error?.message ?? parsed?.message ?? tail ?? 'unknown error';
+      let detail = result?.error ?? tail ?? 'unknown error';
+      detail = typeof detail === 'string' ? detail : JSON.stringify(detail).slice(0, 800);
+      if (detail.includes('Select a model')) {
+        detail = 'ZCode headless has no enabled provider. Only the Z.AI Start Plan is active, and that route is Desktop-only. Enable an API provider (with balance) in ZCode Desktop settings, then pick its model in OpenBot.';
+      }
       sendChunk(sessionId, `ZCode turn failed (exit ${code}): ${detail}`);
       if (sess.promptReply) reply(sess.promptReply, { stopReason: 'refusal' });
     }
