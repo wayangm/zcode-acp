@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.4.2';
+const VERSION = '1.4.3';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -271,14 +271,18 @@ function setModel(params, id) {
     return;
   }
   // Switching moves the model's provider to the front of the CLI's provider order. Each turn
-  // spawns a fresh CLI that re-reads that order, so the next turn runs on the chosen model.
+  // spawns a fresh CLI that re-reads that order, so the next turn runs on the chosen model —
+  // but a RESUMED ZCode session is pinned to the provider it was born on, so every live
+  // session drops its ZCode session id here and the next turn opens a fresh one under the
+  // chosen provider. The trade-off: ZCode-side conversation memory resets on a model switch.
   if (applyProviderOrder(target.modelId.split('/')[0])) {
     ZCODE_MODELS.currentModelId = target.modelId;
-    log('set_model applied:', target.modelId, '(asked:', modelId + ')');
+    for (const s of sessions.values()) s.zcodeSessionId = null;
+    log('set_model applied:', target.modelId, '(asked:', modelId + ') - zcode sessions reset');
     reply(id, {});
   } else {
     // Never fail the turn over a config write; the previously first provider keeps running.
-    log('set_model stored without switch (config write failed):', target.modelId);
+    log('set_model stored without switch (config write failed):', modelId);
     reply(id, {});
   }
 }
