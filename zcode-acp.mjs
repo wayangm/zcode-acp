@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.2.0';
+const VERSION = '1.2.1';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -219,26 +219,31 @@ function newSession(params) {
 }
 
 function setModel(params, id) {
+  // Clients may send a namespaced id (an OpenBot custom agent prefixes its own id, e.g.
+  // `zcode/new-provider/glm-5.3-flash`), so match by suffix. A refused set_model fails the
+  // whole turn in OpenBot, so unknown ids are answered with success and logged instead.
   const modelId = params?.modelId;
-  if (typeof modelId !== 'string' || !ZCODE_MODELS.availableModels.some((m) => m.modelId === modelId)) {
-    log('set_model refused:', modelId);
-    replyError(id, -32602,
-      `Unknown model for ZCode. Available: ${ZCODE_MODELS.availableModels.map((m) => m.modelId).join(', ')}`);
+  const target = ZCODE_MODELS.availableModels.find(
+    (m) => modelId === m.modelId || (typeof modelId === 'string' && modelId.endsWith(`/${m.modelId}`)),
+  );
+  if (!target) {
+    log('set_model no-op (unknown id):', modelId);
+    reply(id, {});
     return;
   }
-  if (modelId === ZCODE_MODELS.currentModelId) {
+  if (target.modelId === ZCODE_MODELS.currentModelId) {
     reply(id, {});
     return;
   }
   // Switching moves the model's provider to the front of the CLI's provider order. Each turn
   // spawns a fresh CLI that re-reads that order, so the next turn runs on the chosen model.
-  if (applyProviderOrder(modelId.split('/')[0])) {
-    ZCODE_MODELS.currentModelId = modelId;
-    log('set_model applied:', modelId);
+  if (applyProviderOrder(target.modelId.split('/')[0])) {
+    ZCODE_MODELS.currentModelId = target.modelId;
+    log('set_model applied:', target.modelId, '(asked:', modelId + ')');
     reply(id, {});
   } else {
     // Never fail the turn over a config write; the previously first provider keeps running.
-    log('set_model stored without switch (config write failed):', modelId);
+    log('set_model stored without switch (config write failed):', target.modelId);
     reply(id, {});
   }
 }
