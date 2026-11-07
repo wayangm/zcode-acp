@@ -1,0 +1,7 @@
+Opening browser for Z.AI authorization.
+Fallback URL:
+https://chat.z.ai/api/oauth/authorize?client_id=client_P8X5CMWmlaRO9gyO-KSqtg&redirect_uri=https://zcode.z.ai/api/v1/oauth/cli/callback/zai&state=f005a50ef2f03c4acde4c87d7f893a5f&response_type=code
+Login successful as putu astari.
+Model: account:zai-individual-coding-plan/GLM-5.3
+Credentials: C:\Users\Kundi Pro\.zcode\v2\credentials.json
+Model selection: C:\Users\Kundi Pro\.zcode\v2\provider_config.json

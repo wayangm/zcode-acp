@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.5.1';
+const VERSION = '1.5.2';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -123,7 +123,11 @@ function prettifyModelName(modelId) {
 }
 
 function readZcodeModels() {
-  const fallback = { currentModelId: 'zcode', availableModels: [{ modelId: 'zcode', name: 'ZCode' }] };
+  const fallback = {
+    currentModelId: 'zcode',
+    availableModels: [{ modelId: 'zcode', name: 'ZCode', description: '' }],
+    index: { zcode: { providerId: '', rawModelId: '' } },
+  };
   try {
     const config = JSON.parse(readFileSync(path.join(zcodeRoot(), 'v2', 'provider_config.json'), 'utf8'));
     const cfgRoot = config?.config;
@@ -136,10 +140,7 @@ function readZcodeModels() {
       if (rule?.config?.enabled === false) disabled.add(`${rule.providerId}/${rule.modelId}`);
     }
     const availableModels = [];
-    // The signed-in Z.AI account (Start Plan) is deliberately NOT listed: the CLI never routes
-    // headless turns to the OAuth login while any known provider rule exists - a `zai` entry in
-    // the provider order is ignored (verified in the CLI logs), so listing it would promise a
-    // model that headless turns cannot reach. The Start Plan stays a Desktop-only route.
+    const index = {};
     for (const providerId of order) {
       const rule = rules.find((r) => r?.providerId === providerId);
       const cfg = rule?.config ?? {};
@@ -147,38 +148,48 @@ function readZcodeModels() {
         ...new Set([...(cfg.modelOrder ?? []), ...(cfg.personalModelIds ?? [])]),
       ].filter((m) => typeof m === 'string' && m && !disabled.has(`${providerId}/${m}`));
       for (const modelId of models) {
+        const modelIdFull = `${providerId}/${modelId}`;
         availableModels.push({
-          modelId: `${providerId}/${modelId}`,
+          modelId: modelIdFull,
           name: `${prettifyModelName(modelId)} · ${rule.providerName ?? providerId}`,
           description: cfg.api?.baseUrl,
         });
+        index[modelIdFull] = { providerId, rawModelId: modelId };
       }
     }
     if (availableModels.length === 0) return fallback;
     const current = availableModels.find((m) => m.modelId.startsWith(`${order[0]}/`))?.modelId;
-    return { currentModelId: current ?? availableModels[0].modelId, availableModels };
+    return { currentModelId: current ?? availableModels[0].modelId, availableModels, index };
   } catch { /* no readable provider config */ }
   return fallback;
 }
 
-// Reads the file fresh, moves the provider to the front, writes atomically. Returns false when
-// the config could not be rewritten; the caller then answers without a switch.
-function applyProviderOrder(providerId) {
+// Reads the file fresh, moves the chosen provider to the front of providerOrder AND writes
+// defaultModelSelection (the headless CLI's primary steering field), then writes atomically.
+// Returns false when the config could not be rewritten; the caller answers without a switch.
+function applyModelSelection(providerId, rawModelId) {
   try {
     const file = path.join(zcodeRoot(), 'v2', 'provider_config.json');
     const config = JSON.parse(readFileSync(file, 'utf8'));
-    const order = config?.config?.providerOrder;
+    const cfgRoot = config?.config;
+    const order = cfgRoot?.providerOrder;
     if (!Array.isArray(order)) return false;
     const index = order.indexOf(providerId);
-    if (index === -1) {
-      // A provider the order does not know yet (the OAuth `zai` account) joins at the front.
-      order.unshift(providerId);
-    } else if (index > 0) {
+    if (index === -1) order.unshift(providerId);
+    else if (index > 0) {
       order.splice(index, 1);
       order.unshift(providerId);
-    } else {
+    } else if (!cfgRoot.defaultModelSelection
+      || cfgRoot.defaultModelSelection.providerId !== providerId
+      || cfgRoot.defaultModelSelection.modelId !== rawModelId) {
+      // Already first; only write when the default model actually changes.
+      cfgRoot.defaultModelSelection = { providerId, modelId: rawModelId };
+      const tmp = `${file}.tmp`;
+      writeFileSync(tmp, JSON.stringify(config, null, 2));
+      renameSync(tmp, file);
       return true;
     }
+    cfgRoot.defaultModelSelection = { providerId, modelId: rawModelId };
     const tmp = `${file}.tmp`;
     writeFileSync(tmp, JSON.stringify(config, null, 2));
     renameSync(tmp, file);
@@ -273,7 +284,11 @@ function newSession(params) {
   const cwd = params?.cwd || process.cwd();
   sessions.set(id, { cwd, zcodeSessionId: null, child: null, stdout: '', stderr: '', promptReply: null });
   log('session created', id, 'cwd:', cwd, 'model:', ZCODE_MODELS.currentModelId);
-  return { sessionId: id, models: ZCODE_MODELS };
+  // Wire response carries only the picker fields; the internal index stays local.
+  return {
+    sessionId: id,
+    models: { currentModelId: ZCODE_MODELS.currentModelId, availableModels: ZCODE_MODELS.availableModels },
+  };
 }
 
 function setModel(params, id) {
@@ -293,12 +308,12 @@ function setModel(params, id) {
     reply(id, {});
     return;
   }
-  // Switching moves the model's provider to the front of the CLI's provider order. Each turn
-  // spawns a fresh CLI that re-reads that order, so the next turn runs on the chosen model —
-  // but a RESUMED ZCode session is pinned to the provider it was born on, so every live
-  // session drops its ZCode session id here and the next turn opens a fresh one under the
-  // chosen provider. The trade-off: ZCode-side conversation memory resets on a model switch.
-  if (applyProviderOrder(target.modelId.split('/')[0])) {
+  // Switching moves the model's provider to the front of the CLI's provider order AND writes
+  // defaultModelSelection (the headless CLI's primary steering field). Each turn spawns a fresh
+  // CLI that re-reads both, so the next turn runs on the chosen model — but a RESUMED ZCode
+  // session is pinned to the provider it was born on, so every live session drops its ZCode
+  // session id here and the next turn opens a fresh one. Trade-off: ZCode-side memory resets.
+  if (applyModelSelection(target.providerId, target.rawModelId)) {
     ZCODE_MODELS.currentModelId = target.modelId;
     for (const s of sessions.values()) s.zcodeSessionId = null;
     log('set_model applied:', target.modelId, '(asked:', modelId + ') - zcode sessions reset');
