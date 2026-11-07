@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.4.3';
+const VERSION = '1.4.4';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -136,20 +136,10 @@ function readZcodeModels() {
       if (rule?.config?.enabled === false) disabled.add(`${rule.providerId}/${rule.modelId}`);
     }
     const availableModels = [];
-    // The signed-in Z.AI account (OAuth, e.g. the Start Plan) is not a provider rule; the CLI
-    // still accepts `zai` in the provider order, so it joins the list when the login exists.
-    let hasZaiLogin = false;
-    try {
-      const credentials = JSON.parse(readFileSync(path.join(zcodeRoot(), 'v2', 'credentials.json'), 'utf8'));
-      hasZaiLogin = Object.keys(credentials).some((key) => key.startsWith('oauth:zai'));
-    } catch { /* no credentials file */ }
-    if (hasZaiLogin) {
-      availableModels.push({
-        modelId: 'zai/glm-5.3-flash',
-        name: 'GLM 5.3 Flash · Start Plan (Free)',
-        description: 'Z.AI account',
-      });
-    }
+    // The signed-in Z.AI account (Start Plan) is deliberately NOT listed: the CLI never routes
+    // headless turns to the OAuth login while any known provider rule exists - a `zai` entry in
+    // the provider order is ignored (verified in the CLI logs), so listing it would promise a
+    // model that headless turns cannot reach. The Start Plan stays a Desktop-only route.
     for (const providerId of order) {
       const rule = rules.find((r) => r?.providerId === providerId);
       const cfg = rule?.config ?? {};
@@ -165,10 +155,7 @@ function readZcodeModels() {
       }
     }
     if (availableModels.length === 0) return fallback;
-    const first = order[0];
-    const current = first === 'zai'
-      ? 'zai/glm-5.3-flash'
-      : availableModels.find((m) => m.modelId.startsWith(`${first}/`))?.modelId;
+    const current = availableModels.find((m) => m.modelId.startsWith(`${order[0]}/`))?.modelId;
     return { currentModelId: current ?? availableModels[0].modelId, availableModels };
   } catch { /* no readable provider config */ }
   return fallback;
