@@ -42,6 +42,11 @@ install lives in a custom place.
 
 ## Notes
 
+- The adapter reports the model that ZCode headless actually runs: the first provider of
+  `providerOrder` and its first model, from the same provider config the CLI reads
+  (`~/.zcode/v2/provider_config.json`). The ZCode CLI has no headless model switch yet, so the
+  picker shows this one model and `session/set_model` refuses other ids. No reasoning-effort
+  options are offered for the same reason.
 - The adapter logs to `os.tmpdir()/zcode-acp.log`.
 - One turn at a time per session. `session/cancel` kills the running turn.
 - `session/load` is not supported; a new ACP session maps to a new ZCode session.

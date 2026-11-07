@@ -1,6 +1,6 @@
 {
   "name": "zcode-acp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Agent Client Protocol (ACP) stdio adapter for the ZCode CLI, for ACP clients such as OpenBot",
   "license": "MIT",
   "type": "module",

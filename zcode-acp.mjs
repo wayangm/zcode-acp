@@ -13,12 +13,12 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
-import { existsSync, appendFileSync, readdirSync } from 'node:fs';
+import { existsSync, appendFileSync, readdirSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -102,6 +102,37 @@ function resolveProviderEnv() {
 
 const SPAWN_ENV = resolveProviderEnv();
 
+// The model ZCode headless actually runs: the first provider of `providerOrder` and its first
+// model, read from the same provider config the CLI reads. The ZCode CLI has no headless model
+// switch (no flag, no env), so listing more than this one model would promise a choice that
+// cannot be honored. `session/set_model` accepts only this id.
+function readZcodeModels() {
+  const home = os.homedir();
+  const root = process.env.ZCODE_HOME?.trim() || path.join(home, '.zcode');
+  const fallback = { currentModelId: 'zcode', availableModels: [{ modelId: 'zcode', name: 'ZCode' }] };
+  try {
+    const config = JSON.parse(readFileSync(path.join(root, 'v2', 'provider_config.json'), 'utf8'));
+    const order = config?.config?.providerOrder;
+    const rules = config?.config?.providerConfigRules?.providerRules;
+    if (!Array.isArray(order) || !Array.isArray(rules)) return fallback;
+    for (const providerId of order) {
+      const rule = rules.find((r) => r?.providerId === providerId);
+      const cfg = rule?.config ?? {};
+      const modelId = cfg.modelOrder?.find((m) => typeof m === 'string' && m) ?? cfg.personalModelIds?.[0];
+      if (!modelId) continue;
+      const id = `${providerId}/${modelId}`;
+      const name = `${modelId} (${rule.providerName ?? providerId})`;
+      return {
+        currentModelId: id,
+        availableModels: [{ modelId: id, name, description: cfg.api?.baseUrl }],
+      };
+    }
+  } catch { /* no readable provider config */ }
+  return fallback;
+}
+
+const ZCODE_MODELS = readZcodeModels();
+
 function write(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');
 }
@@ -148,8 +179,20 @@ function newSession(params) {
   const id = `acp-zcode-${randomUUID()}`;
   const cwd = params?.cwd || process.cwd();
   sessions.set(id, { cwd, zcodeSessionId: null, child: null, stdout: '', stderr: '', promptReply: null });
-  log('session created', id, 'cwd:', cwd);
-  return { sessionId: id };
+  log('session created', id, 'cwd:', cwd, 'model:', ZCODE_MODELS.currentModelId);
+  return { sessionId: id, models: ZCODE_MODELS };
+}
+
+function setModel(params, id) {
+  const modelId = params?.modelId;
+  if (typeof modelId === 'string' && ZCODE_MODELS.availableModels.some((m) => m.modelId === modelId)) {
+    log('set_model ok:', modelId);
+    reply(id, {});
+  } else {
+    log('set_model refused:', modelId);
+    replyError(id, -32602,
+      `ZCode headless runs the model from the provider order in ~/.zcode/v2/provider_config.json (${ZCODE_MODELS.currentModelId}); the ZCode CLI cannot switch models yet.`);
+  }
 }
 
 function promptToText(promptBlocks) {
@@ -285,7 +328,7 @@ rl.on('line', (line) => {
       case 'session/load': replyError(id, -32601, 'loadSession not supported'); break;
       case 'authenticate': reply(id, {}); break;
       case 'session/set_mode': reply(id, {}); break;
-      case 'session/set_model': reply(id, {}); break;
+      case 'session/set_model': setModel(params, id); break;
       default: replyError(id, -32601, `method not supported: ${method}`);
     }
   } else if (method === 'session/cancel') {
