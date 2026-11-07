@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.2.2';
+const VERSION = '1.3.0';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -136,6 +136,20 @@ function readZcodeModels() {
       if (rule?.config?.enabled === false) disabled.add(`${rule.providerId}/${rule.modelId}`);
     }
     const availableModels = [];
+    // The signed-in Z.AI account (OAuth, e.g. the Start Plan) is not a provider rule; the CLI
+    // still accepts `zai` in the provider order, so it joins the list when the login exists.
+    let hasZaiLogin = false;
+    try {
+      const credentials = JSON.parse(readFileSync(path.join(zcodeRoot(), 'v2', 'credentials.json'), 'utf8'));
+      hasZaiLogin = Object.keys(credentials).some((key) => key.startsWith('oauth:zai'));
+    } catch { /* no credentials file */ }
+    if (hasZaiLogin) {
+      availableModels.push({
+        modelId: 'zai/glm-5.3-flash',
+        name: 'GLM 5.3 Flash · Start Plan (Free)',
+        description: 'Z.AI account',
+      });
+    }
     for (const providerId of order) {
       const rule = rules.find((r) => r?.providerId === providerId);
       const cfg = rule?.config ?? {};
@@ -151,7 +165,11 @@ function readZcodeModels() {
       }
     }
     if (availableModels.length === 0) return fallback;
-    return { currentModelId: availableModels[0].modelId, availableModels };
+    const first = order[0];
+    const current = first === 'zai'
+      ? 'zai/glm-5.3-flash'
+      : availableModels.find((m) => m.modelId.startsWith(`${first}/`))?.modelId;
+    return { currentModelId: current ?? availableModels[0].modelId, availableModels };
   } catch { /* no readable provider config */ }
   return fallback;
 }
@@ -163,15 +181,20 @@ function applyProviderOrder(providerId) {
     const file = path.join(zcodeRoot(), 'v2', 'provider_config.json');
     const config = JSON.parse(readFileSync(file, 'utf8'));
     const order = config?.config?.providerOrder;
-    if (!Array.isArray(order) || !order.includes(providerId)) return false;
+    if (!Array.isArray(order)) return false;
     const index = order.indexOf(providerId);
-    if (index > 0) {
+    if (index === -1) {
+      // A provider the order does not know yet (the OAuth `zai` account) joins at the front.
+      order.unshift(providerId);
+    } else if (index > 0) {
       order.splice(index, 1);
       order.unshift(providerId);
-      const tmp = `${file}.tmp`;
-      writeFileSync(tmp, JSON.stringify(config, null, 2));
-      renameSync(tmp, file);
+    } else {
+      return true;
     }
+    const tmp = `${file}.tmp`;
+    writeFileSync(tmp, JSON.stringify(config, null, 2));
+    renameSync(tmp, file);
     return true;
   } catch {
     return false;
