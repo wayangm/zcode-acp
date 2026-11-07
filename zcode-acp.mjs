@@ -18,7 +18,7 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.2.1';
+const VERSION = '1.2.2';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
@@ -110,6 +110,18 @@ function zcodeRoot() {
   return process.env.ZCODE_HOME?.trim() || path.join(os.homedir(), '.zcode');
 }
 
+// Display names follow the ZCode Desktop convention: `glm-5.3-flash` reads as `GLM 5.3 Flash`.
+function prettifyModelName(modelId) {
+  const upper = { glm: 'GLM', ai: 'AI', vl: 'VL', llm: 'LLM', deepseek: 'DeepSeek' };
+  return modelId
+    .replace(/^meta\//, '')
+    .split(/[-_ ]+/)
+    .map((part) => upper[part.toLowerCase()] ?? (/\d/.test(part) || part.length <= 1
+      ? part
+      : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join(' ');
+}
+
 function readZcodeModels() {
   const fallback = { currentModelId: 'zcode', availableModels: [{ modelId: 'zcode', name: 'ZCode' }] };
   try {
@@ -133,7 +145,7 @@ function readZcodeModels() {
       for (const modelId of models) {
         availableModels.push({
           modelId: `${providerId}/${modelId}`,
-          name: `${modelId} (${rule.providerName ?? providerId})`,
+          name: `${prettifyModelName(modelId)} · ${rule.providerName ?? providerId}`,
           description: cfg.api?.baseUrl,
         });
       }
