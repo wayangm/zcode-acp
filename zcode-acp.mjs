@@ -18,28 +18,33 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 
-const VERSION = '1.5.2';
+const VERSION = '1.6.0';
 
 // The ZCode CLI entry ships inside the ZCode Desktop install. Best effort across
 // platforms; set ZCODE_CLI_PATH when the install lives somewhere else.
 function findZcodeCli() {
   if (process.env.ZCODE_CLI_PATH) return process.env.ZCODE_CLI_PATH;
   const home = os.homedir();
+  // Preferred: the locally patched CLI build (Start Plan support for headless turns).
+  const patched = 'D:/DEV/Z/zcode-src/apps/zcode-cli/packages/cli/dist/zcode.cjs';
   const candidates =
-    process.platform === 'win32'
-      ? [
-          path.join(home, 'AppData', 'Local', 'Programs', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
-          path.join(process.env.LOCALAPPDATA ?? path.join(home, 'AppData', 'Local'), 'Programs', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
-        ]
-      : process.platform === 'darwin'
+    [
+      patched,
+      ...(process.platform === 'win32'
         ? [
-            path.join('/', 'Applications', 'ZCode.app', 'Contents', 'Resources', 'glm', 'zcode.cjs'),
-            path.join(home, 'Applications', 'ZCode.app', 'Contents', 'Resources', 'glm', 'zcode.cjs'),
+            path.join(home, 'AppData', 'Local', 'Programs', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
+            path.join(process.env.LOCALAPPDATA ?? path.join(home, 'AppData', 'Local'), 'Programs', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
           ]
-        : [
-            path.join('/', 'opt', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
-            path.join(home, '.local', 'share', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
-          ];
+        : process.platform === 'darwin'
+          ? [
+              path.join('/', 'Applications', 'ZCode.app', 'Contents', 'Resources', 'glm', 'zcode.cjs'),
+              path.join(home, 'Applications', 'ZCode.app', 'Contents', 'Resources', 'glm', 'zcode.cjs'),
+            ]
+          : [
+              path.join('/', 'opt', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
+              path.join(home, '.local', 'share', 'ZCode', 'resources', 'glm', 'zcode.cjs'),
+            ]),
+    ];
   return candidates.find((c) => existsSync(c)) ?? candidates[0];
 }
 
@@ -122,11 +127,16 @@ function prettifyModelName(modelId) {
     .join(' ');
 }
 
+// The Start Plan models, available through the patched local CLI build. They live in the
+// built-in catalog (not provider_config.json), so they are listed explicitly when the shared
+// zcode JWT exists - i.e. when a Z.AI login state is present for the headless CLI to use.
+const START_PLAN_MODELS = ['GLM-5.3-Flash', 'GLM-5.2', 'GLM-5-Turbo'];
+
 function readZcodeModels() {
   const fallback = {
     currentModelId: 'zcode',
     availableModels: [{ modelId: 'zcode', name: 'ZCode', description: '' }],
-    index: { zcode: { providerId: '', rawModelId: '' } },
+    index: { zcode: { providerId: '', rawModelId: '', startPlan: false } },
   };
   try {
     const config = JSON.parse(readFileSync(path.join(zcodeRoot(), 'v2', 'provider_config.json'), 'utf8'));
@@ -141,6 +151,22 @@ function readZcodeModels() {
     }
     const availableModels = [];
     const index = {};
+    let hasZaiJwt = false;
+    try {
+      const credentials = JSON.parse(readFileSync(path.join(zcodeRoot(), 'v2', 'credentials.json'), 'utf8'));
+      hasZaiJwt = Boolean(credentials['zcodejwttoken']?.trim?.());
+    } catch { /* no credentials file */ }
+    if (hasZaiJwt) {
+      for (const modelId of START_PLAN_MODELS) {
+        const modelIdFull = `account:zai-start-plan/${modelId}`;
+        availableModels.push({
+          modelId: modelIdFull,
+          name: `${prettifyModelName(modelId)} · Start Plan (Free)`,
+          description: 'Z.AI account',
+        });
+        index[modelIdFull] = { providerId: 'account:zai-start-plan', rawModelId: modelId, startPlan: true };
+      }
+    }
     for (const providerId of order) {
       const rule = rules.find((r) => r?.providerId === providerId);
       const cfg = rule?.config ?? {};
@@ -154,12 +180,16 @@ function readZcodeModels() {
           name: `${prettifyModelName(modelId)} · ${rule.providerName ?? providerId}`,
           description: cfg.api?.baseUrl,
         });
-        index[modelIdFull] = { providerId, rawModelId: modelId };
+        index[modelIdFull] = { providerId, rawModelId: modelId, startPlan: false };
       }
     }
     if (availableModels.length === 0) return fallback;
-    const current = availableModels.find((m) => m.modelId.startsWith(`${order[0]}/`))?.modelId;
-    return { currentModelId: current ?? availableModels[0].modelId, availableModels, index };
+    // current = defaultModelSelection when it matches a listed model; otherwise the first entry.
+    const selection = cfgRoot?.defaultModelSelection;
+    const selectedId = selection ? `${selection.providerId}/${selection.modelId}` : null;
+    const current = availableModels.find((m) => m.modelId === selectedId)?.modelId
+      ?? availableModels[0].modelId;
+    return { currentModelId: current, availableModels, index };
   } catch { /* no readable provider config */ }
   return fallback;
 }
@@ -167,7 +197,7 @@ function readZcodeModels() {
 // Reads the file fresh, moves the chosen provider to the front of providerOrder AND writes
 // defaultModelSelection (the headless CLI's primary steering field), then writes atomically.
 // Returns false when the config could not be rewritten; the caller answers without a switch.
-function applyModelSelection(providerId, rawModelId) {
+function applyModelSelection(providerId, rawModelId, options) {
   try {
     const file = path.join(zcodeRoot(), 'v2', 'provider_config.json');
     const config = JSON.parse(readFileSync(file, 'utf8'));
@@ -179,17 +209,10 @@ function applyModelSelection(providerId, rawModelId) {
     else if (index > 0) {
       order.splice(index, 1);
       order.unshift(providerId);
-    } else if (!cfgRoot.defaultModelSelection
-      || cfgRoot.defaultModelSelection.providerId !== providerId
-      || cfgRoot.defaultModelSelection.modelId !== rawModelId) {
-      // Already first; only write when the default model actually changes.
-      cfgRoot.defaultModelSelection = { providerId, modelId: rawModelId };
-      const tmp = `${file}.tmp`;
-      writeFileSync(tmp, JSON.stringify(config, null, 2));
-      renameSync(tmp, file);
-      return true;
     }
-    cfgRoot.defaultModelSelection = { providerId, modelId: rawModelId };
+    const selection = { providerId, modelId: rawModelId };
+    if (options) selection.options = options;
+    cfgRoot.defaultModelSelection = selection;
     const tmp = `${file}.tmp`;
     writeFileSync(tmp, JSON.stringify(config, null, 2));
     renameSync(tmp, file);
@@ -313,7 +336,9 @@ function setModel(params, id) {
   // CLI that re-reads both, so the next turn runs on the chosen model — but a RESUMED ZCode
   // session is pinned to the provider it was born on, so every live session drops its ZCode
   // session id here and the next turn opens a fresh one. Trade-off: ZCode-side memory resets.
-  if (applyModelSelection(target.providerId, target.rawModelId)) {
+  const meta = ZCODE_MODELS.index[target.modelId] ?? {};
+  const options = meta.startPlan ? { reasoningLevel: 'max' } : undefined;
+  if (applyModelSelection(meta.providerId, meta.rawModelId, options)) {
     ZCODE_MODELS.currentModelId = target.modelId;
     for (const s of sessions.values()) s.zcodeSessionId = null;
     log('set_model applied:', target.modelId, '(asked:', modelId + ') - zcode sessions reset');
@@ -448,23 +473,25 @@ function startTurn(sessionId, params, id) {
     if (!t || !t.startsWith('{')) { sess.stdout += line + '\n'; return; }
     let event;
     try { event = JSON.parse(t); } catch { sess.stdout += line + '\n'; return; }
-    if (event.type === 'result') { sess.result = event; return; }
+    if (event.type === 'result') { sess.result = event.payload ?? event; return; }
+    // Event data lives in `payload`; fall back to top-level for older emitters.
+    const p = event.payload ?? event;
     if (event.type === 'model.streaming') {
-      if (event.kind === 'text_delta' && typeof event.delta === 'string' && event.delta) {
+      if (p.kind === 'text_delta' && typeof p.delta === 'string' && p.delta) {
         sess.streamedText = true;
-        sendChunk(sessionId, event.delta);
+        sendChunk(sessionId, p.delta);
       }
       return;
     }
     if (event.type === 'tool.updated') {
-      const callId = event.toolCallId ?? `tool-${event.partId ?? event.seq ?? 'x'}`;
-      const title = [event.toolName, typeof event.input === 'string' ? event.input.slice(0, 80) : '']
+      const callId = p.toolCallId ?? `tool-${p.partId ?? p.seq ?? 'x'}`;
+      const title = [p.toolName, typeof p.input === 'string' ? p.input.slice(0, 80) : '']
         .filter(Boolean).join(' ').trim() || 'tool';
-      if (event.kind === 'scheduled') sendToolCall(sessionId, callId, title);
-      else if (event.kind === 'started') sendToolCallUpdate(sessionId, callId, 'in_progress', title);
-      else if (event.kind === 'progress') sendToolCallUpdate(sessionId, callId, 'in_progress', title, event.outputPreview ?? event.stderrTail);
-      else if (event.kind === 'result') sendToolCallUpdate(sessionId, callId, 'completed', title, event.outputPreview ?? event.stdoutTail);
-      else if (event.kind === 'error') sendToolCallUpdate(sessionId, callId, 'failed', title, event.outputPreview);
+      if (p.kind === 'scheduled') sendToolCall(sessionId, callId, title);
+      else if (p.kind === 'started') sendToolCallUpdate(sessionId, callId, 'in_progress', title);
+      else if (p.kind === 'progress') sendToolCallUpdate(sessionId, callId, 'in_progress', title, p.outputPreview ?? p.stderrTail);
+      else if (p.kind === 'result') sendToolCallUpdate(sessionId, callId, 'completed', title, p.outputPreview ?? p.stdoutTail);
+      else if (p.kind === 'error') sendToolCallUpdate(sessionId, callId, 'failed', title, p.outputPreview);
     }
   });
   child.on('error', (e) => {
